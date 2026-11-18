@@ -94,3 +94,126 @@ class StorageAndServiceTests(unittest.IsolatedAsyncioTestCase):
             first, last = connection.execute(
                 "SELECT first_seen_utc, last_seen_utc FROM users WHERE user_id = 5"
             ).fetchone()
+        first, last = datetime.fromisoformat(first), datetime.fromisoformat(last)
+        self.assertEqual(first.utcoffset(), timezone.utc.utcoffset(None))
+        self.assertEqual(last.utcoffset(), timezone.utc.utcoffset(None))
+        self.assertLessEqual(first, last)
+
+    async def test_service_replies(self):
+        self.assertIn("count: 0", await self.service.status(1))
+        self.assertIn("Welcome!", await self.service.start(1))
+        self.assertIn("Welcome back!", await self.service.start(1))
+        self.assertIn("count: 2", await self.service.status(1))
+        self.assertIn("count: 0", await self.service.status(2))
+        for command in ("/start", "/help", "/status"):
+            self.assertIn(command, self.service.help())
+
+
+# Keep core tests runnable without dependencies. CI must install requirements.txt
+# and explicitly verify both dependencies are importable before running this suite.
+HAS_DEPS = all(importlib.util.find_spec(name) is not None for name in ("aiogram", "dotenv"))
+if HAS_DEPS:
+    from aiogram import Bot
+    from aiogram.types import Message, Update
+    from bot import TokenRedactingFormatter, create_dispatcher, run
+
+
+@unittest.skipUnless(HAS_DEPS, "Install requirements.txt for Aiogram integration tests")
+class TelegramIntegrationTests(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self):
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        self.settings = load_settings({"BOT_TOKEN": TOKEN,
+                                      "DATABASE_PATH": str(Path(directory.name) / "bot.sqlite3"),
+                                      "ALLOWED_USER_IDS": "10,20"})
+        self.database = Database(self.settings.database_path)
+        await self.database.initialize()
+        self.dispatcher = create_dispatcher(self.settings, BotService(self.database))
+        self.bot = Bot(token=TOKEN)
+        self.addAsyncCleanup(self.bot.session.close)
+        # A real Bot and Dispatcher, but all Telegram I/O is intercepted.
+        self.request = AsyncMock(side_effect=AssertionError("Unexpected Telegram API request"))
+        guard = patch.object(self.bot.session, "make_request", self.request)
+        guard.start()
+        self.addCleanup(guard.stop)
+        self.update_id = 0
+
+    async def dispatch(self, text, user_id=10, chat_type="private"):
+        self.update_id += 1
+        update = Update.model_validate({"update_id": self.update_id, "message": {
+            "message_id": self.update_id, "date": 1700000000, "text": text,
+            "chat": {"id": user_id if chat_type == "private" else -1001, "type": chat_type},
+            "from": {"id": user_id, "is_bot": False, "first_name": "Test"},
+        }})
+        with patch.object(Message, "answer", new_callable=AsyncMock) as answer:
+            await self.dispatcher.feed_update(self.bot, update)
+            self.request.assert_not_called()
+            return answer
+
+    async def test_real_dispatcher_commands(self):
+        answer = await self.dispatch("/start")
+        answer.assert_awaited_once()
+        self.assertIn("Welcome!", answer.await_args.args[0])
+        answer = await self.dispatch("/help")
+        answer.assert_awaited_once()
+        self.assertIn("/status", answer.await_args.args[0])
+        answer = await self.dispatch("/status")
+        self.assertIn("count: 1", answer.await_args.args[0])
+        answer = await self.dispatch("/status", user_id=20)
+        self.assertIn("count: 0", answer.await_args.args[0])
+
+    async def test_access_control(self):
+        answer = await self.dispatch("/start", user_id=99)
+        answer.assert_awaited_once_with("Access denied.", parse_mode=None)
+        self.assertEqual(await self.database.count_users(), 0)
+        answer = await self.dispatch("/start", chat_type="group")
+        answer.assert_not_awaited()
+        self.assertEqual(await self.database.count_users(), 0)
+
+    async def test_handler_error_is_sanitized(self):
+        with patch.object(self.database, "record_start", new_callable=AsyncMock,
+                          side_effect=RuntimeError(TOKEN)):
+            with self.assertLogs("middlewares.security", level="ERROR") as logs:
+                answer = await self.dispatch("/start")
+        answer.assert_awaited_once_with("Something went wrong. Please try again later.", parse_mode=None)
+        self.assertNotIn(TOKEN, "\n".join(logs.output))
+
+    async def test_webhook_is_not_deleted(self):
+        fake = AsyncMock()
+        fake.get_webhook_info.return_value = SimpleNamespace(url="https://example.invalid/hook")
+        dispatcher = SimpleNamespace(start_polling=AsyncMock())
+        with patch("bot.Bot", return_value=fake), patch("bot.create_dispatcher", return_value=dispatcher):
+            with self.assertLogs("bot", level="ERROR"):
+                with self.assertRaises(ConfigError):
+                    await run(self.settings)
+        fake.delete_webhook.assert_not_called()
+        dispatcher.start_polling.assert_not_called()
+        fake.session.close.assert_awaited_once()
+
+    async def test_polling_configuration_and_cleanup(self):
+        fake = AsyncMock()
+        fake.get_webhook_info.return_value = SimpleNamespace(url="")
+        dispatcher = SimpleNamespace(start_polling=AsyncMock(),
+                                     resolve_used_update_types=lambda: ["message"])
+        with patch("bot.Bot", return_value=fake), patch("bot.create_dispatcher", return_value=dispatcher):
+            await run(self.settings)
+        dispatcher.start_polling.assert_awaited_once_with(
+            fake, allowed_updates=["message"], close_bot_session=False,
+            tasks_concurrency_limit=16, tasks_shutdown_timeout=20, handle_as_tasks=True,
+        )
+        fake.session.close.assert_awaited_once()
+        fake.delete_webhook.assert_not_called()
+
+    async def test_logging_redacts_token(self):
+        from urllib.parse import quote
+        formatter = TokenRedactingFormatter(TOKEN)
+        record = logging.LogRecord("test", logging.ERROR, __file__, 1,
+                                   "%s %s", (TOKEN, quote(TOKEN, safe="")), None)
+        rendered = formatter.format(record)
+        self.assertNotIn(TOKEN, rendered)
+        self.assertNotIn(quote(TOKEN, safe=""), rendered)
+        self.assertEqual(rendered.count("[REDACTED]"), 2)
+
+
+if __name__ == "__main__":
+    unittest.main()
