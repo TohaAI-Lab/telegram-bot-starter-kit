@@ -1,3 +1,7 @@
+![Telegram Bot Starter Kit — TohaAI Lab](./banner.png)
+
+*Illustrative project banner.*
+
 # Telegram Bot Starter Kit
 
 ### A modular Python foundation for Telegram bots
