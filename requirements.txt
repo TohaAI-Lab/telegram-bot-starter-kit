@@ -1,0 +1,5 @@
+# TohaAI Lab - Telegram Bot Starter Kit
+# Python 3.11+
+
+aiogram==3.32.0
+python-dotenv==1.2.4
