@@ -1,0 +1,37 @@
+# TohaAI Lab - example systemd unit for a dedicated Linux deployment.
+# Create the service account and install the app before enabling this unit.
+# The project-root .env must be readable by the service account, not public.
+# Adjust paths and the dedicated account for your own installation.
+
+[Unit]
+Description=TohaAI Lab Telegram Bot Starter Kit
+Wants=network-online.target
+After=network-online.target
+StartLimitIntervalSec=120
+StartLimitBurst=5
+
+[Service]
+Type=simple
+User=telegram-starter
+Group=telegram-starter
+WorkingDirectory=/opt/telegram-bot-starter-kit
+ExecStart=/opt/telegram-bot-starter-kit/.venv/bin/python /opt/telegram-bot-starter-kit/bot.py
+Environment=PYTHONUNBUFFERED=1
+Environment=PYTHONDONTWRITEBYTECODE=1
+Environment=DATABASE_PATH=/var/lib/telegram-bot-starter-kit/bot.sqlite3
+StateDirectory=telegram-bot-starter-kit
+StateDirectoryMode=0700
+UMask=0077
+Restart=on-failure
+RestartSec=5s
+RestartPreventExitStatus=2
+TimeoutStopSec=40s
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
